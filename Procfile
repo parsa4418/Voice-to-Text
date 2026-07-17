@@ -1,1 +1,1 @@
-web: python tts_bot.py
+web: python tts_stt_bot.py
