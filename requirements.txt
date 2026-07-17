@@ -1,2 +1,5 @@
 python-telegram-bot
 gtts
+speechrecognition
+pydub
+requests
