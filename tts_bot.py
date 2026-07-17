@@ -1,6 +1,5 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-import gtts
 import speech_recognition as sr
 from pydub import AudioSegment
 import os
@@ -8,7 +7,7 @@ import tempfile
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
-import requests
+import gtts
 
 TOKEN = "8607192869:AAFR5T11mG2_SUMOBP9U6bYaDogERzWdRDU"  # ← توکن خودت رو بذار
 
@@ -73,7 +72,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
-# ================== تبدیل متن به صدا (با fallback) ==================
+# ================== تبدیل متن به صدا (با چندین زبان) ==================
 async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
@@ -86,23 +85,23 @@ async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔄 در حال تبدیل متن به صدا...")
 
-    try:
-        # تلاش با زبان فارسی
-        tts = gtts.gTTS(text, lang='fa', slow=False)
-        tts.save("voice.mp3")
-    except:
+    languages = ['fa', 'com', 'ar', 'en']  # زبان‌های مختلف برای امتحان
+
+    for lang in languages:
         try:
-            # تلاش با زبان 'com' (برخی نسخه‌ها پشتیبانی می‌کنن)
-            tts = gtts.gTTS(text, lang='com', slow=False)
+            tts = gtts.gTTS(text, lang=lang, slow=False)
             tts.save("voice.mp3")
+            
+            with open("voice.mp3", "rb") as audio:
+                await update.message.reply_audio(audio, caption=f"🎵 فایل صوتی شما (زبان: {lang})!")
+            
+            os.remove("voice.mp3")
+            return  # اگر موفق شد، از حلقه خارج میشه
         except:
-            await update.message.reply_text("❌ خطا در تبدیل متن به صدا. لطفاً متن رو کوتاه‌تر یا ساده‌تر کن.")
-            return
+            continue  # اگر خطا داد، زبان بعدی رو امتحان کن
 
-    with open("voice.mp3", "rb") as audio:
-        await update.message.reply_audio(audio, caption="🎵 فایل صوتی شما!")
-
-    os.remove("voice.mp3")
+    # اگه هیچ زبانی جواب نداد
+    await update.message.reply_text("❌ خطا در تبدیل متن به صدا. لطفاً متن رو کوتاه‌تر یا ساده‌تر کن.")
 
 # ================== تبدیل صدا به متن ==================
 async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
