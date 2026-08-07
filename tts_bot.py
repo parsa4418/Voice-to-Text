@@ -3,6 +3,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 import speech_recognition as sr
 from pydub import AudioSegment
 import os
+import re
 import tempfile
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -10,6 +11,9 @@ import asyncio
 import edge_tts
 
 TOKEN = "8607192869:AAFR5T11mG2_SUMOBP9U6bYaDogERzWdRDU"  # ← توکن خودت رو بذار
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN تنظیم نشده! توی تنظیمات Render اضافه‌ش کن.")
 
 # ================== سرور برای Render ==================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -31,13 +35,27 @@ def get_main_keyboard():
     keyboard = [[InlineKeyboardButton("🎵 راهنما", callback_data="help")]]
     return InlineKeyboardMarkup(keyboard)
 
+# ================== تشخیص زبان و انتخاب صدا ==================
+def detect_language_and_voice(text: str) -> str:
+    """
+    اگر متن حاوی حروف فارسی/عربی باشه صدای فارسی انتخاب می‌شه،
+    در غیر این صورت صدای انگلیسی.
+    """
+    persian_pattern = re.compile(r'[\u0600-\u06FF]')
+    if persian_pattern.search(text):
+        # نزدیک‌ترین صدای فارسیِ جوون و طبیعی
+        return "fa-IR-DilaraNeural"
+    else:
+        # نزدیک‌ترین صدای انگلیسیِ جوون/شاداب (نزدیک‌ترین گزینه به "بچگونه")
+        return "en-US-AnaNeural"
+
 # ================== دستور /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎙️ **ربات تبدیل صدا و متن**\n\n"
-        "🔹 **متن به صدا:** یه متن فارسی بفرست.\n"
+        "🔹 **متن به صدا:** یه متن فارسی یا انگلیسی بفرست.\n"
         "🔹 **صدا به متن:** یه فایل صوتی بفرست.\n\n"
-        "✅ زبان فارسی با کیفیت بالا\n"
+        "✅ تشخیص خودکار زبان (فارسی/انگلیسی)\n"
         "⚠️ متن: حداکثر ۳۰۰ کاراکتر\n"
         "⚠️ صدا: حداکثر ۲ مگابایت",
         reply_markup=get_main_keyboard(),
@@ -52,8 +70,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📖 **راهنما:**\n\n"
             "✅ **متن به صدا:**\n"
-            "یه متن فارسی بفرست.\n"
-            "بات با کیفیت بالا فایل MP3 برمی‌گردونه.\n\n"
+            "متن فارسی یا انگلیسی بفرست، بات زبان رو خودش تشخیص می‌ده\n"
+            "و با صدای طبیعی فایل MP3 برمی‌گردونه.\n\n"
             "✅ **صدا به متن:**\n"
             "یه فایل صوتی (OGG/MP3) بفرست.\n"
             "بات متن تشخیص داده شده رو برمی‌گردونه.\n\n"
@@ -65,7 +83,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "back":
         await query.edit_message_text(
             "🎙️ **ربات تبدیل صدا و متن**\n\n"
-            "🔹 **متن به صدا:** یه متن فارسی بفرست.\n"
+            "🔹 **متن به صدا:** یه متن فارسی یا انگلیسی بفرست.\n"
             "🔹 **صدا به متن:** یه فایل صوتی بفرست.",
             reply_markup=get_main_keyboard()
         )
@@ -81,29 +99,28 @@ async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ متن خیلی طولانیه! حداکثر ۳۰۰ کاراکتر.")
         return
 
-    await update.message.reply_text("🔄 در حال تبدیل متن به صدا (با کیفیت بالا)...")
+    voice = detect_language_and_voice(text)
+    lang_label = "فارسی" if "fa-IR" in voice else "انگلیسی"
 
+    await update.message.reply_text(f"🔄 در حال تبدیل متن به صدا ({lang_label})...")
+
+    output_file = None
     try:
-        # انتخاب صدای فارسی با لهجه‌ی ایرانی
-        voice = "fa-IR-DilaraNeural"  # صدای زنانه ایرانی
-        
-        # گزینه‌های جایگزین (اگه صدای بالا کار نکرد)
-        # voice = "fa-IR-FaridNeural"  # صدای مردانه ایرانی
-        
-        output_file = "voice.mp3"
-        
-        # تبدیل متن به صدا با edge-tts
+        # فایل موقت مخصوص هر درخواست، تا با چند کاربر همزمان تداخل نداشته باشه
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+            output_file = tmp_mp3.name
+
         communicate = edge_tts.Communicate(text, voice)
         await communicate.save(output_file)
 
-        # ارسال فایل صوتی
         with open(output_file, "rb") as audio:
-            await update.message.reply_audio(audio, caption="🎵 فایل صوتی با کیفیت بالا!")
-
-        os.remove(output_file)
+            await update.message.reply_audio(audio, caption=f"🎵 فایل صوتی ({lang_label})")
 
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در تبدیل متن به صدا:\n{e}")
+    finally:
+        if output_file and os.path.exists(output_file):
+            os.remove(output_file)
 
 # ================== تبدیل صدا به متن ==================
 async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,6 +141,8 @@ async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔄 در حال تبدیل صدا به متن...")
 
+    ogg_path = None
+    wav_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
             ogg_path = tmp_ogg.name
@@ -148,11 +167,13 @@ async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except sr.RequestError:
                 await update.message.reply_text("❌ خطا در ارتباط با سرور تشخیص صدا.")
 
-        os.remove(ogg_path)
-        os.remove(wav_path)
-
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در پردازش فایل:\n{e}")
+    finally:
+        if ogg_path and os.path.exists(ogg_path):
+            os.remove(ogg_path)
+        if wav_path and os.path.exists(wav_path):
+            os.remove(wav_path)
 
 # ================== اجرا ==================
 def main():
@@ -165,7 +186,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, speech_to_text))
     app.add_handler(MessageHandler(filters.AUDIO, speech_to_text))
 
-    print("✅ ربات تبدیل صدا و متن با edge-tts روشن شد!")
+    print("✅ ربات تبدیل صدا و متن (فارسی/انگلیسی) روشن شد!")
     app.run_polling()
 
 if __name__ == "__main__":
