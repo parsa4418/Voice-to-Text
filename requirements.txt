@@ -1,5 +1,4 @@
 python-telegram-bot
-speechrecognition
+speech_recognition
 pydub
-requests
 edge-tts
