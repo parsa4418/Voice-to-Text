@@ -2,3 +2,4 @@ python-telegram-bot
 faster-whisper
 pydub
 edge-tts
+audioop-lts
