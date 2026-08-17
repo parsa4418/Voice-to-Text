@@ -3,3 +3,5 @@ faster-whisper
 pydub
 edge-tts
 audioop-lts
+youtube-transcript-api
+yt-dlp
