@@ -19,6 +19,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
 
 # ⚠️ توکن رو از Environment Variable بخون، نه اینکه توی کد بذاری
 # چون این توکن قبلاً یه بار توی چت افشا شده، حتماً از BotFather ریجنریتش کن
@@ -35,6 +37,10 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 START_COINS = 2
 COINS_PER_REFERRAL = 1
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 مگابایت
+
+YOUTUBE_REGEX = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})"
+)
 
 # مدل Whisper محلی: tiny سبک‌ترینه (مناسب پلن رایگان رندر)، base دقیق‌تره ولی سنگین‌تر
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "tiny")
@@ -186,6 +192,7 @@ def welcome_text(coins: int) -> str:
     return (
         "🎙️ **ربات تبدیل صدا، فیلم و آهنگ به متن**\n\n"
         "🔹 **صدا به متن:** ویس، فایل صوتی، آهنگ یا فیلم بفرست تا متنش رو بگیری\n"
+        "🔹 **لینک یوتیوب:** لینک یه ویدیوی یوتیوب رو بفرست تا متنش رو بگیری\n"
         "🔹 **متن به صدا:** یه متن فارسی یا انگلیسی بفرست\n\n"
         "✅ تشخیص خودکار زبان (فارسی/انگلیسی)\n"
         f"💰 موجودی فعلی شما: **{coins} سکه**\n\n"
@@ -334,6 +341,19 @@ async def admin_gift_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ================== مسیریابی پیام‌های متنی ==================
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text.startswith("/"):
+        return
+
+    match = YOUTUBE_REGEX.search(text)
+    if match:
+        await handle_youtube_link(update, context, match.group(1))
+    else:
+        await text_to_speech(update, context)
+
+
 # ================== تبدیل متن به صدا (edge-tts) ==================
 async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -375,6 +395,89 @@ async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if output_file and os.path.exists(output_file):
             os.remove(output_file)
+
+
+# ================== تشخیص متن از لینک یوتیوب ==================
+def get_youtube_captions(video_id: str) -> str:
+    """
+    اول سعی می‌کنه زیرنویس رسمی/خودکار یوتیوب رو بگیره (سریع و دقیق، بدون Whisper).
+    اگه هیچ زیرنویسی نبود، رشته خالی برمی‌گردونه.
+    """
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcript_list.find_transcript(["fa", "en"])
+        except Exception:
+            transcript = next(iter(transcript_list))
+        entries = transcript.fetch()
+        return " ".join(e["text"] for e in entries if e.get("text")).strip()
+    except Exception:
+        return ""
+
+
+def download_youtube_audio(video_id: str, output_path: str) -> None:
+    """صدای ویدیو رو دانلود و به wav تبدیل می‌کنه (برای وقتی زیرنویس نداره)."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_path.replace(".wav", ""),
+        "quiet": True,
+        "noplaylist": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "wav",
+        }],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+
+def get_youtube_duration_minutes(video_id: str) -> float:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return (info.get("duration") or 0) / 60
+
+
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE, video_id: str):
+    message = update.message
+    user_id = update.effective_user.id
+    get_or_register_user(user_id)
+
+    if not use_coin(user_id):
+        await message.reply_text(
+            "❌ سکه‌هات تموم شده! برای گرفتن سکه رایگان دوستاتو دعوت کن:",
+            reply_markup=get_no_coins_keyboard(),
+        )
+        return
+
+    await message.reply_text("🔄 در حال بررسی ویدیو...")
+
+    try:
+        # مسیر اول: زیرنویس آماده یوتیوب (سریع و دقیق)
+        text = await asyncio.to_thread(get_youtube_captions, video_id)
+
+        if not text:
+            # مسیر دوم: دانلود صدا و تشخیص با Whisper
+            await message.reply_text("🔄 زیرنویس نداشت، در حال دانلود و تبدیل صدا... (کمی طول می‌کشه)")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                wav_path = tmp.name
+            try:
+                await asyncio.to_thread(download_youtube_audio, video_id, wav_path)
+                text = await asyncio.to_thread(transcribe_file, wav_path)
+            finally:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+
+        if text:
+            await message.reply_text(f"📝 **متن ویدیو:**\n\n{text}", parse_mode="Markdown")
+        else:
+            add_coins(user_id, 1)
+            await message.reply_text("❌ نتونستم متنی از این ویدیو استخراج کنم (سکه‌ت برگشت).")
+
+    except Exception as e:
+        add_coins(user_id, 1)
+        await message.reply_text(f"❌ خطا در پردازش ویدیو (سکه‌ت برگشت):\n{e}")
 
 
 # ================== تشخیص متن از فایل صوتی/تصویری ==================
@@ -489,7 +592,7 @@ def main():
     app.add_handler(admin_gift_conv)
 
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_to_speech))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL,
