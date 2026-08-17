@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import sqlite3
@@ -6,7 +7,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import edge_tts
-import speech_recognition as sr
+from faster_whisper import WhisperModel
 from pydub import AudioSegment
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,7 +35,18 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 START_COINS = 2
 COINS_PER_REFERRAL = 1
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 مگابایت
-CHUNK_MS = 55 * 1000  # طول هر تکه صدا برای تشخیص گفتار (میلی‌ثانیه)
+
+# مدل Whisper محلی: tiny سبک‌ترینه (مناسب پلن رایگان رندر)، base دقیق‌تره ولی سنگین‌تر
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "tiny")
+_whisper_model = None
+
+
+def get_whisper_model() -> WhisperModel:
+    """مدل رو فقط بار اول لود می‌کنه (لود کردنش کند و سنگینه)."""
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _whisper_model
 
 ASK_TARGET_ID, ASK_AMOUNT = range(2)
 
@@ -366,47 +378,27 @@ async def text_to_speech(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================== تشخیص متن از فایل صوتی/تصویری ==================
-def _recognize_chunk(recognizer: sr.Recognizer, chunk: AudioSegment) -> str:
-    """یه تکه صدا رو می‌گیره و متنش رو برمی‌گردونه (اول فارسی، بعد انگلیسی)."""
-    tmp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    try:
-        chunk.export(tmp_path, format="wav")
-        with sr.AudioFile(tmp_path) as source:
-            audio_data = recognizer.record(source)
-        try:
-            return recognizer.recognize_google(audio_data, language="fa-IR")
-        except sr.UnknownValueError:
-            try:
-                return recognizer.recognize_google(audio_data, language="en-US")
-            except sr.UnknownValueError:
-                return ""
-        except sr.RequestError:
-            return ""
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
 def transcribe_file(input_path: str) -> str:
     """
-    هر فرمت صوتی یا تصویری رو می‌گیره، صداش رو استخراج می‌کنه (اگه فیلم باشه)،
-    به تکه‌های کوتاه تقسیم می‌کنه (برای دقت بهتر تشخیص گفتار) و متن کامل رو برمی‌گردونه.
-    اگه هیچی تشخیص داده نشه، رشته خالی برمی‌گردونه.
+    هر فرمت صوتی یا تصویری رو می‌گیره، صداش رو استخراج می‌کنه (اگه فیلم باشه)
+    و با مدل Whisper محلی متنش رو برمی‌گردونه. اگه چیزی تشخیص نده رشته خالی برمی‌گردونه.
+    این تابع خودش CPU-bound و کندشونده، پس همیشه باید توی thread جدا صدا زده بشه.
     """
-    # pydub با کمک ffmpeg تقریباً همه‌ی فرمت‌های صوتی و تصویری رو می‌خونه
-    # و در صورت فیلم بودن، خودکار فقط ترک صدا رو استخراج می‌کنه
-    audio = AudioSegment.from_file(input_path)
-    audio = audio.set_channels(1).set_frame_rate(16000)
+    wav_path = input_path + "_converted.wav"
+    try:
+        # pydub با کمک ffmpeg تقریباً همه‌ی فرمت‌های صوتی و تصویری رو می‌خونه
+        # و در صورت فیلم بودن، خودکار فقط ترک صدا رو استخراج می‌کنه
+        audio = AudioSegment.from_file(input_path)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        audio.export(wav_path, format="wav")
 
-    recognizer = sr.Recognizer()
-    texts = []
-    for start_ms in range(0, len(audio), CHUNK_MS):
-        chunk = audio[start_ms:start_ms + CHUNK_MS]
-        piece = _recognize_chunk(recognizer, chunk)
-        if piece:
-            texts.append(piece)
-
-    return " ".join(texts).strip()
+        model = get_whisper_model()
+        # Whisper خودش زبان رو تشخیص می‌ده و طول فایل رو خودش مدیریت می‌کنه (نیازی به تکه‌تکه کردن دستی نیست)
+        segments, _info = model.transcribe(wav_path, beam_size=5, vad_filter=True)
+        return " ".join(segment.text.strip() for segment in segments).strip()
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 
 async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,7 +454,7 @@ async def speech_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             input_path = tmp_file.name
         await tg_file.download_to_drive(input_path)
 
-        text = transcribe_file(input_path)  # رشته خالی یعنی چیزی تشخیص داده نشد
+        text = await asyncio.to_thread(transcribe_file, input_path)  # رشته خالی یعنی چیزی تشخیص داده نشد
 
         if text:
             await message.reply_text(f"📝 **متن تشخیص داده شده:**\n\n{text}", parse_mode="Markdown")
